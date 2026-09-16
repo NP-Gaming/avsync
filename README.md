@@ -1,4 +1,4 @@
-# AVSync v14 — Audio/Video Synchronization Engine
+# AVSync v14.1 — Audio/Video Synchronization Engine
 
 ![Python](https://img.shields.io/badge/Python-3.8+-yellow.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
@@ -9,10 +9,20 @@ Typical use case: you have an English reference release with correct timing, and
 
 ## How It Works
 
-1. **Image Pairing** — Scene-change frames are extracted from both videos with FFmpeg, then matched via OpenCV template matching (`TM_CCOEFF_NORMED`) to build a set of visual anchors linking the two timelines.
+1. **Image Pairing** — Scene-change frames are extracted from both videos with FFmpeg, then matched via OpenCV template matching (`TM_CCOEFF_NORMED`) to build a set of visual anchors linking the two timelines. _(Still takes significantly longer than 'normal' mode, scaling exponentially with time.)_
 2. **Audio Synchronization** — The foreign audio is split into segments defined by the anchors. Each segment is time-stretched (`atempo`) so its duration matches the corresponding reference segment, then concatenated and padded to align with the reference start.
 3. **Subtitle Synchronization** — Text subtitles are retimed with the same per-segment stretch as the audio. Bitmap subtitles are passed through unchanged (see below).
 4. **Muxing** — The reference video, its original audio, the synced foreign track(s), and subtitles are combined into the final file. On MKV, `mkvmerge` is used so all original streams, chapters, fonts, and metadata are preserved untouched.
+
+What's New in v14.1
+
+- Brought back old matching with the --use_precise_sync argument. Also updated it to make it a bit faster by using a cache similar to Anchor-and-follow frame matching.
+- Changed processing resolution to respect aspect ratios, massively improving matching capabilities for video streams of different aspect ratios (i.e. old 4:3 SD "cropped" video file with dubbing to a new 16:9 HD re-release).
+- Added a few "PostMuxing" capabilities:
+  - Extraction of synced dubbing to separate audio files. (Why bother? If you use media servers like Jellyfin, they can read external audio files. Adding a separate audio file does not change the media file, and thus there is no need for Jellyfin to redo tasks like trickplay image extraction, or intro skipper analysis for segments.)
+  - Extraction of synced subtitles to separate files.
+  - Deletion of synced video file after successful extraction of subtitles and/or audio files.
+
 
 ## What's New in v14
 
@@ -88,6 +98,9 @@ python AVSync_batch.py ./ref ./foreign ./output --foreign_lang jpn --foreign_tra
 | `--qc_output_dir` | none | Write side-by-side QC comparison images |
 | `--output_csv` | none | Write an anchor/segment report |
 | `--verbose` | off | Show DEBUG-level detail |
+| `--use_precise_sync` | off | Use precise audio/video synchronization. _(Can create better synced audio at the cost of time.)_ |
+| `--extract_synced_audio` / `extract_synced_subtitles` | off | After creation of synced media, export synced dubbing/subtitles as separate file(s) |
+| `--delete_synced_videofile_after_export` | off | After succesful export of audiofile/subtitles delete the synced media file |
 
 ## Subtitle Behavior at a Glance
 
