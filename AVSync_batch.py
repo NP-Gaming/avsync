@@ -7,7 +7,7 @@ from typing import List
 
 # --- Configuration ---
 # The name of the main script to be called.
-AVSYNC_SCRIPT_NAME = "AVSync_v14.py"
+AVSYNC_SCRIPT_NAME = "AVSync_v14.1.py"
 
 # A tuple of common video file extensions to look for (case-insensitive).
 VIDEO_EXTENSIONS = ('.mkv', '.mp4', '.avi', '.mov', '.ts', '.webm')
