@@ -1181,52 +1181,66 @@ def extract_frames_ffmpeg(video_path, output_folder, scene_threshold):
     logger.info(f"> Extracted {final_count} scene frames from {vid_name}")
     return True, [os.path.basename(f) for f in frame_files], parsed_pts_times
 
-def process_image_pair_for_match(ref_img_name, foreign_image_list, ref_extract_folder, foreign_extract_folder, match_threshold):
-    """Compares one reference image against a list of foreign images using template matching."""
-    ref_img_path = os.path.join(ref_extract_folder, ref_img_name)
-    try:
-        # Read reference image, convert to grayscale, and resize for consistent comparison
-        ref_frame_orig = cv2.imread(ref_img_path, cv2.IMREAD_GRAYSCALE)
-        if ref_frame_orig is None:
-            logger.warning(f"Could not read reference image: {ref_img_name}"); return None
-        ref_frame_comp = cv2.resize(ref_frame_orig, (RESIZE_WIDTH, RESIZE_HEIGHT), interpolation=cv2.INTER_AREA)
-        if ref_frame_comp is None or ref_frame_comp.size == 0:
-             logger.warning(f"Failed to resize reference image: {ref_img_name}"); return None
-    except Exception as e:
-        logger.error(f"Error processing reference image {ref_img_name}: {e}", exc_info=False); return None
+def resize_to_fixed_height(image, height, interpolation=cv2.INTER_AREA):
+    """
+    Resizes an image based on requested height. Maintaining its aspect ratio.
+    """
 
-    best_match_foreign_name = None
-    best_score = -1.0 # Initialize score below any possible match
+    image_w, image_h = image.shape[:2]
+    calc_w = int(image_w * (height / image_h))
 
-    # Iterate through potential foreign matches (this list might be pre-filtered)
-    for foreign_img_name in foreign_image_list:
-        foreign_img_path = os.path.join(foreign_extract_folder, foreign_img_name)
+    return cv2.resize(image, (calc_w, height), interpolation=interpolation)
+
+def process_image_pair_for_match(ref_name, candidate_names, ref_extract_path, foreign_frame_cache, match_threshold, first_match_stop=False, preloaded_ref_comp=None):
+    """
+    Function Compares one reference image against a list of foreign images using template matching.
+    """
+
+    if preloaded_ref_comp is not None:
+        ref_frame_comp = preloaded_ref_comp
+    else:
+        # Fallback if the image wasn't preloaded for some reason.
         try:
-            # Read, grayscale, and resize foreign image
-            foreign_frame_orig = cv2.imread(foreign_img_path, cv2.IMREAD_GRAYSCALE)
-            if foreign_frame_orig is None: continue # Skip if image can't be read
-            foreign_frame_comp = cv2.resize(foreign_frame_orig, (RESIZE_WIDTH, RESIZE_HEIGHT), interpolation=cv2.INTER_AREA)
-            if foreign_frame_comp is None or foreign_frame_comp.size == 0: continue # Skip if resize fails
+            ref_img = cv2.imread(os.path.join(ref_extract_path, ref_name), cv2.IMREAD_GRAYSCALE)
+            if ref_img is None: return None
+            ref_frame_comp = resize_to_fixed_height(ref_img, RESIZE_HEIGHT)
+        except Exception:
+            return None
+    
+    best_foreign_name = None
+    best_score = -1.0
 
-            # Perform template matching
-            # TM_CCOEFF_NORMED gives a score between -1 and 1, where 1 is a perfect match
-            result = cv2.matchTemplate(foreign_frame_comp, ref_frame_comp, cv2.TM_CCOEFF_NORMED)
-            _minVal, maxVal, _minLoc, _maxLoc = cv2.minMaxLoc(result) # We only need the max value
-
-            # Update best match if current score is higher
-            if maxVal > best_score:
-                best_score = maxVal
-                best_match_foreign_name = foreign_img_name
-        except Exception as e:
-            # Log error but continue checking other foreign images
-            logger.debug(f"Error comparing {ref_img_name} with {foreign_img_name}: {e}", exc_info=False)
+    for c_name in candidate_names:
+        c_name_str = str(c_name)
+        if c_name_str not in foreign_frame_cache:
             continue
 
-    # Return the best match only if its score meets the threshold
-    if best_match_foreign_name is not None and best_score >= match_threshold:
-        return (best_match_foreign_name, best_score)
-    else:
-        return None # No match found above the threshold
+        foreign_frame_comp = foreign_frame_cache[c_name_str]
+        
+        try:
+            if ref_frame_comp.shape[1] >= foreign_frame_comp.shape[1]:
+                # Refrence is wider or equal to width of forein video
+                result = cv2.matchTemplate(ref_frame_comp, foreign_frame_comp, cv2.TM_CCOEFF_NORMED)
+            else:
+                # Foreign is wider than foreign video
+                result = cv2.matchTemplate(foreign_frame_comp, ref_frame_comp, cv2.TM_CCOEFF_NORMED)
+            _minVal, maxVal, _minLoc, _maxLoc = cv2.minMaxLoc(result)
+        except Exception:
+            continue
+
+        # If a new highest score, update
+        if maxVal > best_score:
+            best_score = maxVal
+            best_foreign_name = c_name_str
+            
+            # Break if not first result is good enough
+            if first_match_stop and best_score >= match_threshold:
+                break
+
+    if best_foreign_name is not None and best_score >= match_threshold:
+        return (best_foreign_name, best_score)
+    
+    return None
 
 def filter_similar_ref_images(initial_matches_with_times, ref_extract_folder, similarity_threshold):
     """Filters out reference frames that are too visually similar using perceptual hashing."""
@@ -1383,7 +1397,6 @@ def filter_temporal_inconsistency(matches_after_similarity):
     # Return a list of tuples: [(ref_filename, foreign_filename, ref_time, foreign_time)]
     return filtered_list
 
-
 def run_image_pairing_stage(ref_video_path, foreign_video_path, temp_dir, scene_threshold, match_threshold, similarity_threshold):
     """Orchestrates the entire image pairing stage."""
     logger.info("\n===== Image Pairing Stage =====")
@@ -1434,7 +1447,9 @@ def run_image_pairing_stage(ref_video_path, foreign_video_path, temp_dir, scene_
         try:
             img = cv2.imread(f_path, cv2.IMREAD_GRAYSCALE)
             if img is not None:
-                resized = cv2.resize(img, (RESIZE_WIDTH, RESIZE_HEIGHT), interpolation=cv2.INTER_AREA)
+                # Replaced with calculated with resizing
+                # resized = cv2.resize(img, (RESIZE_WIDTH, RESIZE_HEIGHT), interpolation=cv2.INTER_AREA)
+                resized = resize_to_fixed_height(img, RESIZE_HEIGHT, cv2.INTER_AREA)
                 if resized is not None and resized.size > 0:
                     foreign_frame_cache[f_name] = resized
                 else:
@@ -1477,7 +1492,9 @@ def run_image_pairing_stage(ref_video_path, foreign_video_path, temp_dir, scene_
             if ref_img is None:
                 skipped_count += 1
                 continue
-            ref_frame_comp = cv2.resize(ref_img, (RESIZE_WIDTH, RESIZE_HEIGHT), interpolation=cv2.INTER_AREA)
+            # Replaced with calculated with resizing
+            # ref_frame_comp = cv2.resize(ref_img, (RESIZE_WIDTH, RESIZE_HEIGHT), interpolation=cv2.INTER_AREA)
+            ref_frame_comp = resize_to_fixed_height(ref_img, RESIZE_HEIGHT, cv2.INTER_AREA)
             if ref_frame_comp is None or ref_frame_comp.size == 0:
                 skipped_count += 1
                 continue
@@ -1524,29 +1541,22 @@ def run_image_pairing_stage(ref_video_path, foreign_video_path, temp_dir, scene_
         best_foreign_name = None
         best_foreign_ts = None
 
-        for c_name, c_ts in zip(candidate_names, candidate_ts):
-            c_name_str = str(c_name)
-            if c_name_str not in foreign_frame_cache:
-                continue
+        match_result = process_image_pair_for_match(
+            ref_name,
+            candidate_names,
+            None,
+            foreign_frame_cache,
+            match_threshold,
+            first_match_stop=True,
+            preloaded_ref_comp=ref_frame_comp
+        )
 
-            foreign_frame_comp = foreign_frame_cache[c_name_str]
-            try:
-                result = cv2.matchTemplate(foreign_frame_comp, ref_frame_comp, cv2.TM_CCOEFF_NORMED)
-                _, maxVal, _, _ = cv2.minMaxLoc(result)
-            except Exception as e:
-                logger.debug(f"matchTemplate error {ref_name} vs {c_name_str}: {e}")
-                continue
-
-            if maxVal > best_score:
-                best_score = maxVal
-                best_foreign_name = c_name_str
-                best_foreign_ts = float(c_ts)
-                # Early stop: good enough match found near estimated position
-                if best_score >= match_threshold:
-                    break
-
-        # Record match if above threshold
-        if best_foreign_name is not None and best_score >= match_threshold:
+        if match_result:
+            best_foreign_name, best_score = match_result
+            
+            # Since the function returns only the name, we get the timestamp here
+            best_foreign_ts = float(foreign_timestamps_dict[best_foreign_name])
+            
             initial_matches_dict[ref_name] = (best_foreign_name, ref_time, best_foreign_ts)
 
             # Set anchor on first match
@@ -1561,6 +1571,182 @@ def run_image_pairing_stage(ref_video_path, foreign_video_path, temp_dir, scene_
 
     match_elapsed_time = time.time() - match_start_time
     logger.info(f"  -> Anchor-and-follow matching complete. Found {len(initial_matches_dict)} potential pairs ({skipped_count} skipped). ({match_elapsed_time:.2f}s).")
+
+    if not initial_matches_dict:
+        logger.error("No initial matches found between reference and foreign frames. Cannot proceed.")
+        return None
+
+    # --- Step 4: Filter Similar Reference Images ---
+    matches_after_sim_filter = filter_similar_ref_images(initial_matches_dict, ref_extract_path, similarity_threshold)
+    if not matches_after_sim_filter:
+        logger.error("No matches remaining after similarity filtering.")
+        return None
+
+    # --- Step 5: Filter Temporal Inconsistencies ---
+    # Result is a list: [(ref_filename, foreign_filename, ref_time, foreign_time), ...]
+    visual_anchors_details = filter_temporal_inconsistency(matches_after_sim_filter)
+    if not visual_anchors_details:
+        logger.error("No matches remaining after temporal filtering.")
+        return None
+
+    final_anchor_count = len(visual_anchors_details)
+    stage_elapsed_time = time.time() - stage_start_time
+    logger.info(f"---=== Image Pairing Stage Finished ({stage_elapsed_time:.2f}s). Generated {final_anchor_count} visual anchors ===---")
+    return visual_anchors_details # Return list of detailed anchor tuples
+
+def run_precise_image_pairing_stage(ref_video_path, foreign_video_path, temp_dir, scene_threshold, match_threshold, similarity_threshold):
+    """
+    Orchestrates the entire image pairing stage.
+    More precise syncing method, returned from v12
+    Instead of going with first match over the threshold (closet to predicted location of match), it goes with the best match.
+    """
+    logger.info("\n===== Precise Image Pairing Stage =====")
+    stage_start_time = time.time()
+
+    # Define paths for extracted frames
+    ref_extract_path = os.path.join(temp_dir, "Extracted_Reference")
+    foreign_extract_path = os.path.join(temp_dir, "Extracted_Foreign")
+
+    # --- Step 1: Extract Frames ---
+    ref_extract_ok, ref_filenames, ref_timestamps_list = extract_frames_ffmpeg(ref_video_path, ref_extract_path, scene_threshold)
+    if not ref_extract_ok:
+        logger.error("Failed to extract reference frames.")
+        return None
+
+    foreign_extract_ok, foreign_filenames, foreign_timestamps_list = extract_frames_ffmpeg(foreign_video_path, foreign_extract_path, scene_threshold)
+    if not foreign_extract_ok:
+        logger.error("Failed to extract foreign frames.")
+        return None
+
+    # --- Step 1.5: Calculate Search Window ---
+    logger.info("--- Calculating Frame Match Search Window ---")
+    ref_duration = get_file_duration(ref_video_path, media_type='video')
+    if ref_duration is None or ref_duration <= 0:
+        logger.warning("Could not determine reference video duration or duration is zero. Frame matching will compare against ALL foreign frames.")
+        match_search_window_seconds = float('inf') # Effectively disable windowing
+    else:
+        match_search_window_seconds = ref_duration * MATCH_WINDOW_PERCENT
+        logger.info(f"  Reference duration: {ref_duration:.2f}s")
+        logger.info(f"  Calculated frame match search window: +/- {match_search_window_seconds:.2f}s ({MATCH_WINDOW_PERCENT*100}%)")
+
+    # --- Step 2: Map filenames to timestamps ---
+    logger.info("--- Mapping Timestamps to Extracted Frames ---")
+    ref_timestamps_dict = {name: ts for name, ts in zip(ref_filenames, ref_timestamps_list)}
+    foreign_timestamps_dict = {name: ts for name, ts in zip(foreign_filenames, foreign_timestamps_list)}
+    if not ref_timestamps_dict or not foreign_timestamps_dict:
+        logger.error("  ERROR: Failed to create timestamp dictionaries.")
+        return None
+    logger.info(f"  -> Mapped {len(ref_timestamps_dict)} reference and {len(foreign_timestamps_dict)} foreign timestamps.")
+
+    # --- Step 2.5: Pre-cache all foreign frames (read + resize once) ---
+    logger.info("--- Pre-caching Foreign Frames ---")
+    foreign_frame_cache = {}  # {filename: resized_grayscale_ndarray}
+    cache_failures = 0
+    for f_name in tqdm(foreign_filenames, desc="  Caching Foreign Frames", unit="frame", ncols=100, leave=False):
+        f_path = os.path.join(foreign_extract_path, f_name)
+        try:
+            img = cv2.imread(f_path, cv2.IMREAD_GRAYSCALE)
+            if img is not None:
+                # Replaced with calculated with resizing
+                # resized = cv2.resize(img, (RESIZE_WIDTH, RESIZE_HEIGHT), interpolation=cv2.INTER_AREA)
+                resized = resize_to_fixed_height(img, RESIZE_HEIGHT, cv2.INTER_AREA)
+                if resized is not None and resized.size > 0:
+                    foreign_frame_cache[f_name] = resized
+                else:
+                    cache_failures += 1
+            else:
+                cache_failures += 1
+        except Exception as e:
+            logger.debug(f"Failed to cache foreign frame {f_name}: {e}")
+            cache_failures += 1
+    logger.info(f"  -> Cached {len(foreign_frame_cache)} foreign frames ({cache_failures} failures)")
+
+    # Build sorted foreign timestamps array for fast windowing
+    foreign_ts_array = np.array([foreign_timestamps_dict[fn] for fn in foreign_filenames])
+    foreign_names_array = np.array(foreign_filenames)
+
+    # --- Step 3: Initial Frame Matching (Parallel with Windowing) ---
+    logger.info(f"--- Initial Frame Matching (Template Threshold: {match_threshold}, Window: +/- {match_search_window_seconds:.2f}s) ---")
+    match_start_time = time.time()
+    initial_matches_dict = {} # Stores {ref_name: (foreign_name, ref_time, foreign_time)}
+    # === CORRECTION START ===
+    future_to_ref_name = {} # Use a dictionary to map Futures to ref_names
+    # === CORRECTION END ===
+
+    # Use ThreadPoolExecutor for parallel image comparison
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        # Submit tasks: compare each reference frame against a WINDOW of foreign frames
+        for ref_name in ref_filenames:
+            ref_time = ref_timestamps_dict.get(ref_name)
+            if ref_time is None:
+                logger.warning(f"Skipping match for ref frame {ref_name}: missing timestamp.")
+                continue
+
+            # Determine the time window for foreign frame search
+            min_foreign_time = ref_time - match_search_window_seconds
+            max_foreign_time = ref_time + match_search_window_seconds
+
+            # Filter foreign filenames based on timestamp window
+            mask = (foreign_ts_array >= min_foreign_time) & (foreign_ts_array <= max_foreign_time)
+            candidate_indices = np.where(mask)[0]
+
+            # Only submit task if there are candidates within the window
+            if len(candidate_indices) > 0:  
+                candidate_foreign_frames = foreign_names_array[candidate_indices]
+                
+                future = executor.submit(process_image_pair_for_match,
+                                         ref_name,
+                                         candidate_foreign_frames, 
+                                         ref_extract_path,
+                                         foreign_frame_cache,
+                                         match_threshold,
+                                         first_match_stop=False)
+                # === CORRECTION START ===
+                future_to_ref_name[future] = ref_name # Store mapping in dictionary
+                # === CORRECTION END ===
+            else:
+                logger.debug(f"No foreign frame candidates found within window for ref frame {ref_name} (time {ref_time:.3f}s)")
+
+
+        # Process results as they complete
+        num_processed = 0
+        skipped_count = 0
+        # === CORRECTION START ===
+        # Pass only the futures (dictionary keys) to as_completed
+        futures_iterable = concurrent.futures.as_completed(future_to_ref_name)
+        progress_bar = tqdm(total=len(future_to_ref_name), desc="  Matching Frames", unit="frame", ncols=100, leave=False)
+
+        for future in futures_iterable: # Iterate through completed futures
+            ref_name = future_to_ref_name[future] # Get the ref_name using the dictionary
+        # === CORRECTION END ===
+            try:
+                result = future.result() # Get result from the completed thread
+                if result:
+                    # If a match was found (foreign_name, score)
+                    foreign_name = result[0]
+                    # Retrieve corresponding timestamps
+                    # No need to get ref_time again, it's already mapped
+                    foreign_time = foreign_timestamps_dict.get(foreign_name)
+                    # Store the match details if timestamps are valid
+                    if ref_timestamps_dict.get(ref_name) is not None and foreign_time is not None: # Ensure both timestamps are valid
+                        initial_matches_dict[ref_name] = (foreign_name, ref_timestamps_dict[ref_name], foreign_time)
+                    else:
+                         logger.warning(f"Timestamp missing for match: Ref '{ref_name}', Foreign '{foreign_name}'")
+                         skipped_count += 1
+                # else: No match found above threshold in the window for this ref_frame
+            except Exception as e:
+                # Catch errors from individual threads
+                logger.error(f"\nError processing match task for ref frame {ref_name}: {e}", exc_info=False) # Less verbose stack trace for worker errors
+                skipped_count += 1
+            finally:
+                num_processed += 1
+                progress_bar.update(1)
+        progress_bar.close()
+
+    del foreign_frame_cache  # Free memory
+
+    match_elapsed_time = time.time() - match_start_time
+    logger.info(f"  -> Initial matching complete. Found {len(initial_matches_dict)} potential pairs ({skipped_count} skipped). ({match_elapsed_time:.2f}s).")
 
     if not initial_matches_dict:
         logger.error("No initial matches found between reference and foreign frames. Cannot proceed.")
@@ -2670,6 +2856,113 @@ def _mux_with_ffmpeg(args, ref_stream_idx, synced_foreign_tracks, synced_subtitl
     success, _ = run_ffmpeg(ffmpeg_cmd, "Mux Final Video (ffmpeg)")
     return success
 
+# --- Post Muxing Functions---
+
+def get_stream_info_posmux(input_file, stream_type):
+    """Probes the file for specific streams ('a' for audio, 's' for subtitle)."""
+    cmd = [
+        "ffprobe", "-v", "error", "-select_streams", stream_type,
+        "-show_entries", "stream=index,codec_name,disposition:stream_tags=title,language",
+        "-of", "json", input_file
+    ]
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace')
+    if not result.stdout:
+        return []
+    return json.loads(result.stdout).get('streams', [])
+
+def extract_new_audio(final_video, ref_video, synced_foreign_tracks):
+    """Extracts ONLY the newly synced audio tracks from the final muxed video."""
+    if not synced_foreign_tracks:
+        return True
+        
+    num_ref_audio = len(get_stream_info_posmux(ref_video, 'a'))
+    final_streams = get_stream_info_posmux(final_video, 'a')
+    
+    success = True
+    base_dir = os.path.dirname(final_video)
+    base_name = os.path.splitext(os.path.basename(final_video))[0]
+
+    # Mapping of supported audio containers to codecs
+    mapping = {'aac': '.m4a', 'mp3': '.mp3', 'ac3': '.ac3', 'dts': '.dts', 'flac': '.flac', 
+               'wav': '.wav', 'opus': '.opus', 'vorbis': '.ogg', 'pcm_s16le': '.wav', 
+               'truehd': '.mka', 'eac3': '.mka'} 
+               
+    for i, track_info in enumerate(synced_foreign_tracks):
+        relative_idx = num_ref_audio + i
+        if relative_idx >= len(final_streams):
+            logger.error(f"Cannot extract new audio {i}: Stream index out of range.")
+            success = False
+            continue
+            
+        s = final_streams[relative_idx]
+        absolute_idx = s.get('index')
+        codec = s.get('codec_name', 'ac3')
+        lang = s.get('tags', {}).get('language', track_info.get('language', 'und')).lower()
+        
+        ext = mapping.get(codec, f'.{codec}')
+        out_name = f"{base_name}.{lang}.stream{relative_idx}{ext}"
+        out_path = os.path.join(base_dir, out_name)
+        
+        cmd = ["ffmpeg", "-y", "-fflags", "+genpts", "-i", final_video, "-map", f"0:{absolute_idx}", "-vn", "-acodec", "copy", "-metadata:s:a:0", f"language={lang}"]
+        
+        if codec == 'aac' and ext == '.m4a':
+            cmd += ['-bsf:a', 'aac_adtstoasc']
+        if codec in ['truehd', 'eac3'] or ext == '.mka':
+            cmd += ['-f', 'matroska']
+            
+        cmd.append(out_path)
+        
+        try:
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            logger.info(f"  -> Extracted audio stream {relative_idx}: {out_name}")
+        except Exception as e:
+            logger.error(f"  -> Failed to extract audio stream {relative_idx}: {e}")
+            success = False
+            
+    return success
+
+def extract_new_subtitles(final_video, ref_video, synced_subtitles):
+    """Extracts ONLY the newly synced subtitle tracks from the final muxed video."""
+    if not synced_subtitles:
+        return True
+        
+    num_ref_subs = len(get_stream_info_posmux(ref_video, 's'))
+    final_streams = get_stream_info_posmux(final_video, 's')
+    
+    success = True
+    base_dir = os.path.dirname(final_video)
+    base_name = os.path.splitext(os.path.basename(final_video))[0]
+    
+    mapping = {'subrip': '.srt', 'srt': '.srt', 'ass': '.ass', 'ssa': '.ssa', 
+               'mov_text': '.srt', 'webvtt': '.vtt', 'dvd_subtitle': '.sub', 'pgssub': '.sup'}
+               
+    for i, sub_info in enumerate(synced_subtitles):
+        relative_idx = num_ref_subs + i
+        if relative_idx >= len(final_streams):
+            logger.error(f"Cannot extract new subtitle {i}: Stream index out of range.")
+            success = False
+            continue
+            
+        s = final_streams[relative_idx]
+        absolute_idx = s.get('index')
+        codec = s.get('codec_name', 'srt')
+        lang = s.get('tags', {}).get('language', sub_info.get('language', 'und')).lower()
+        
+        ext = mapping.get(codec, '.srt')
+        track_label = f"track{i+1}" if len(synced_subtitles) > 1 else "synced"
+        out_name = f"{base_name}.{lang}.stream{relative_idx}{ext}"
+        out_path = os.path.join(base_dir, out_name)
+        
+        cmd = ["ffmpeg", "-y", "-i", final_video, "-map", f"0:{absolute_idx}", "-c:s", "copy", out_path]
+        
+        try:
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            logger.info(f"  -> Extracted newly synced subtitle: {out_name}")
+        except Exception as e:
+            logger.error(f"  -> Failed to extract new subtitle stream: {e}")
+            success = False
+            
+    return success
 
 # --- Main Execution ---
 # --- SUBTITLE SYNCHRONIZATION FUNCTIONS ---
@@ -3252,6 +3545,7 @@ Workflow:
              "Example: '00:00:10:500>00:00:10:800,00:02:00:300>00:02:01:000' creates sync points "
              "at ref 10.5s->foreign 10.8s and ref 120.3s->foreign 121.0s. "
              "These bypass scene detection and are guaranteed sync points.")
+    img_group.add_argument("--use_precise_sync", action="store_true", help="Use precise audio/video synchronization. (It can create better synced audio at the cost of exponentially longer sync times dependent on lenght of the source.) (default: disabled)")
     # Note: Match search window is now calculated automatically, not a direct argument
 
     # --- Audio Processing Arguments ---
@@ -3277,6 +3571,11 @@ Workflow:
     mux_group.add_argument("--mux_foreign_codec", default=DEFAULT_MUX_ACODEC, help=f"Audio codec for the synced foreign track in the muxed output (e.g., 'aac', 'ac3', 'copy'). (Default: {DEFAULT_MUX_ACODEC})")
     mux_group.add_argument("--mux_foreign_bitrate", default=DEFAULT_MUX_ABITRATE, help=f"Audio bitrate for the synced foreign track if re-encoding (e.g., '192k', '320k'). (Default: {DEFAULT_MUX_ABITRATE})")
 
+    # --- Post Muxing Arguments ---
+    postmux_group = parser.add_argument_group('Post Muxing Arguments')
+    postmux_group.add_argument("--extract_synced_audio", action="store_true", help="After creation of synced media, export synced dubbing as separate file(s) (default: disabled)")
+    postmux_group.add_argument("--extract_synced_subtitles", action="store_true", help="After creation of synced media, export synced subtittles as separate file(s) (default: disabled)")
+    postmux_group.add_argument("--delete_synced_videofile_after_export", action="store_true", help="After succesful export of audiofile/subtitles delete the synced media file (default: disabled)")
 
     # --- Caching Arguments ---
     cache_group = parser.add_argument_group('Caching Parameters')
@@ -3321,7 +3620,7 @@ Workflow:
     # Professional startup banner
     logger.info("")
     logger.info("=" * 70)
-    logger.info(" AVSync v14 - Audio/Video Synchronization Engine")
+    logger.info(" AVSync v14.1 - Audio/Video Synchronization Engine")
     logger.info("=" * 70)
     logger.info(f"Reference video : {args.ref_video}")
     logger.info(f"Foreign video   : {args.foreign_video}")
@@ -3447,8 +3746,12 @@ Workflow:
     logger.info(f"Scene Threshold: {args.scene_threshold}, Match Threshold: {args.match_threshold}, Similarity Threshold: {args.similarity_threshold}")
     if args.force_sync_points:
         logger.info(f"Forced Sync Points: {args.force_sync_points}")
-    logger.info(f"Frame Match: Anchor-and-follow (initial: +/- {MATCH_WINDOW_PERCENT*100}% of ref duration, subsequent: +{ANCHOR_FOLLOW_FORWARD_WINDOW_S}s forward)")
-
+    if not args.use_precise_sync:
+        logger.info(f"Frame Match: Anchor-and-follow (initial: +/- {MATCH_WINDOW_PERCENT*100}% of ref duration, subsequent: +{ANCHOR_FOLLOW_FORWARD_WINDOW_S}s forward)")
+    else:
+        logger.info(f"Frame Match: Precise compare")
+        logger.info(f"Frame Match Window: Calculated as {MATCH_WINDOW_PERCENT*100}% of reference video duration")
+        
     # Validate output directories are writable for all specified outputs
     output_paths_to_check = [args.output_video, args.output_audio, args.output_csv]
     for path in output_paths_to_check:
@@ -3516,14 +3819,24 @@ Workflow:
         
         # Run image pairing if not loaded from cache
         if visual_anchors_details is None:
-            visual_anchors_details = run_image_pairing_stage(
-                ref_video_path=args.ref_video,
-                foreign_video_path=args.foreign_video,
-                temp_dir=temp_dir,
-                scene_threshold=args.scene_threshold,
-                match_threshold=args.match_threshold,
-                similarity_threshold=args.similarity_threshold
-            )
+            if not args.use_precise_sync:
+                visual_anchors_details = run_image_pairing_stage(
+                    ref_video_path=args.ref_video,
+                    foreign_video_path=args.foreign_video,
+                    temp_dir=temp_dir,
+                    scene_threshold=args.scene_threshold,
+                    match_threshold=args.match_threshold,
+                    similarity_threshold=args.similarity_threshold
+                )
+            else:
+                visual_anchors_details = run_precise_image_pairing_stage(
+                    ref_video_path=args.ref_video,
+                    foreign_video_path=args.foreign_video,
+                    temp_dir=temp_dir,
+                    scene_threshold=args.scene_threshold,
+                    match_threshold=args.match_threshold,
+                    similarity_threshold=args.similarity_threshold
+                )
             if visual_anchors_details is None:
                 raise RuntimeError("Image Pairing Stage Failed: No visual anchors generated.")
             
@@ -3647,6 +3960,32 @@ Workflow:
                 raise RuntimeError("Muxing Stage Failed.")
         else:
              raise RuntimeError("Audio synchronization did not complete successfully, cannot mux.")
+
+        # === Stage 4: PostMuxing ===
+        # Extracted from final muxed file, as this resulted in better output in testing.
+        postmux_success = True
+
+        if args.extract_synced_audio:
+            logger.info("Extracting newly synced audio tracks...")
+            audio_ok = extract_new_audio(args.output_video, args.ref_video, synced_foreign_tracks_for_mux)
+            if not audio_ok:
+                postmux_success = False
+        
+        if args.extract_synced_subtitles:
+            sub_ok = extract_new_subtitles(args.output_video, args.ref_video, synced_subtitles)
+            if not sub_ok:
+                postmux_success = False
+        
+        if args.delete_synced_videofile_after_export:
+            if postmux_success:
+                try:
+                    os.remove(args.output_video)
+                    logger.info(f"Successfully deleted synced video file: {args.output_video}")
+                except Exception as e:
+                    logger.error(f"Failed to delete synced video file: {e}")
+            else:
+                logger.warning("Skipping deletion of synced video file due previous error in postmuxing.")
+
 
     except RuntimeError as e:
         logger.error(f"Process aborted due to error: {e}")
